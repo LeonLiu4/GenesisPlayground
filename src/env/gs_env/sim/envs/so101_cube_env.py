@@ -3,6 +3,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as R
 
 import genesis as gs
@@ -15,7 +16,7 @@ class SO101CubeEnv:
     def __init__(self) -> None:
         # Create Genesis scene
         self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(substeps=4),
+            sim_options=gs.options.SimOptions(substeps=1),
             rigid_options=gs.options.RigidOptions(
                 enable_joint_limit=True,
                 enable_collision=True,
@@ -73,6 +74,11 @@ class SO101CubeEnv:
 
         # Store entities for easy access
         self.robot = self.entities["robot"]
+        
+        # Task parameters
+        self.target_position = None
+        self.success_threshold = 0.05  # 5cm threshold for success
+        self.is_success = False
 
     def initialize(self) -> None:
         """Initialize the environment."""
@@ -84,8 +90,9 @@ class SO101CubeEnv:
         # Update target visualization
         self._update_target_visualization()
 
-        # Randomize cube position
+        # Randomize cube position and set new target
         self._randomize_cube()
+        self._set_new_target()
 
 
     def apply_command(self, command: Any) -> None:
@@ -97,6 +104,7 @@ class SO101CubeEnv:
 
         # Handle special commands
         if command.reset_scene:
+            self._remove_target_visualization()  # Remove target before reset
             self.reset_idx(None)
         elif command.quit_teleop:
             print("Quit command received from teleop")
@@ -117,6 +125,9 @@ class SO101CubeEnv:
             cube_pos = np.zeros(3)
             cube_quat = np.array([1, 0, 0, 0])
 
+        # Check if task is successful
+        self._check_success(cube_pos)
+        
         # Create observation
         observation = {
             'joint_positions': robot_obs['joint_positions'],
@@ -124,6 +135,8 @@ class SO101CubeEnv:
             'end_effector_quat': robot_obs['end_effector_quat'],
             'cube_pos': cube_pos,
             'cube_quat': cube_quat,
+            'target_pos': self.target_position,
+            'is_success': self.is_success,
             'rgb_images': {},  # No cameras in this simple setup
             'depth_images': {}  # No depth sensors in this simple setup
         }
@@ -143,15 +156,21 @@ class SO101CubeEnv:
         # Update target visualization
         self._update_target_visualization()
 
-        # Randomize cube position
+        # Randomize cube position and set new target
         self._randomize_cube()
+        self._set_new_target()
 
 
     def _update_target_visualization(self) -> None:
         """Update target visualization to match robot end-effector."""
         try:
             pos, quat = self.entities["robot"].get_ee_pose()
-            if pos is not None:
+            if pos is not None and quat is not None:
+                # Ensure we have numpy arrays
+                if isinstance(pos, torch.Tensor):
+                    pos = pos.cpu().numpy()
+                if isinstance(quat, torch.Tensor):
+                    quat = quat.cpu().numpy()
                 self.entities["target"].set_qpos(np.concatenate([pos, quat]))
         except Exception as e:
             print(f"Failed to update target visualization: {e}")
@@ -169,6 +188,52 @@ class SO101CubeEnv:
             self.entities["cube"].set_quat(cube_quat)
         except Exception as e:
             print(f"Failed to randomize cube: {e}")
+
+    def _set_new_target(self) -> None:
+        """Set a new reachable target position for the cube."""
+        try:
+            # Remove any existing target visualization
+            self._remove_target_visualization()
+            
+            # Generate a reachable target position (within robot workspace)
+            self.target_position = np.array([
+                random.uniform(0.15, 0.35),  # X: closer to robot base
+                random.uniform(-0.15, 0.15),  # Y: within reach
+                0.0  # Z: on the ground plane
+            ])
+            
+            # Visualize target with debug sphere
+            self.scene.draw_debug_sphere(
+                pos=self.target_position,
+                radius=0.02,
+                color=(1.0, 0.0, 0.0, 0.8)  # Red sphere
+            )
+            
+            # Reset success flag
+            self.is_success = False
+            
+        except Exception as e:
+            print(f"Failed to set new target: {e}")
+
+    def _remove_target_visualization(self) -> None:
+        """Remove the target visualization from the scene."""
+        try:
+            # Clear all debug spheres (this removes the target)
+            self.scene.clear_debug_objects()
+        except Exception as e:
+            print(f"Failed to remove target visualization: {e}")
+
+    def _check_success(self, cube_pos: NDArray[np.float64]) -> None:
+        """Check if the cube is close enough to the target."""
+        if self.target_position is not None:
+            distance = np.linalg.norm(cube_pos - self.target_position)
+            if distance <= self.success_threshold:
+                if not self.is_success:
+                    self.is_success = True
+                    print(f"SUCCESS! Cube reached target (distance: {distance:.3f}m)")
+                    # Remove target visualization and auto-reset after success
+                    self._remove_target_visualization()
+                    self.reset_idx(None)
 
 
     def step(self) -> None:
